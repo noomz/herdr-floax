@@ -8,6 +8,8 @@ license = "MIT"
 [dependencies]
 # TUI drawing; also re-exports crossterm so backend + terminal setup share one version.
 ratatui = "0.29"
+# `events` feature for EnableMouseCapture/DisableMouseCapture (SGR mouse).
+crossterm = { version = "0.28", features = ["events"] }
 # The embedded terminal: portable-pty spawns the shell PTY, vt100 emulates it.
 portable-pty = "0.8"
 vt100 = "0.15"

@@ -35,8 +35,8 @@ pub fn box_inner(area: Rect, cfg: &Config) -> Rect {
     )
 }
 
-/// Draw one frame: backdrop, box chrome, embedded screen, cursor.
-pub fn draw(f: &mut Frame, cfg: &Config, screen: &vt100::Screen) {
+/// Draw one frame: backdrop, box chrome, embedded screen, selection, cursor.
+pub fn draw(f: &mut Frame, cfg: &Config, screen: &vt100::Screen, sel: &crate::mouse::Selection) {
     let area = f.area();
 
     // Backdrop. The app cannot composite live herdr panes behind the box
@@ -65,7 +65,7 @@ pub fn draw(f: &mut Frame, cfg: &Config, screen: &vt100::Screen) {
     let inner = chrome.inner(boxr);
     f.render_widget(chrome, boxr);
 
-    render_screen(f.buffer_mut(), inner, screen);
+    render_screen(f.buffer_mut(), inner, screen, sel);
 
     if !screen.hide_cursor() {
         let (r, c) = screen.cursor_position();
@@ -75,9 +75,11 @@ pub fn draw(f: &mut Frame, cfg: &Config, screen: &vt100::Screen) {
     }
 }
 
-/// Paint the vt100 screen's cells into the buffer at `area`'s offset.
-fn render_screen(buf: &mut Buffer, area: Rect, screen: &vt100::Screen) {
+/// Paint the vt100 screen's cells into the buffer at `area`'s offset,
+/// highlighting the active selection.
+fn render_screen(buf: &mut Buffer, area: Rect, screen: &vt100::Screen, sel: &crate::mouse::Selection) {
     let (rows, cols) = screen.size();
+    let span = sel.span(rows, cols);
     for r in 0..rows.min(area.height) {
         let mut skip_next = false; // second half of a wide (CJK/emoji) cell
         for c in 0..cols.min(area.width) {
@@ -108,8 +110,24 @@ fn render_screen(buf: &mut Buffer, area: Rect, screen: &vt100::Screen) {
             if cell.inverse() {
                 style = style.add_modifier(Modifier::REVERSED);
             }
+            if in_selection(span, r, c) {
+                style = style.add_modifier(Modifier::REVERSED);
+            }
             target.set_style(style);
             skip_next = cell.is_wide();
+        }
+    }
+}
+
+/// Whether cell `(r, c)` falls in the selection span (middle rows of a
+/// multi-line span are fully selected; only the first/last rows are
+/// column-bounded).
+fn in_selection(span: Option<(u16, u16, u16, u16)>, r: u16, c: u16) -> bool {
+    match span {
+        None => false,
+        Some((r0, r1, c0, c1)) if r0 == r1 => r == r0 && c >= c0 && c <= c1,
+        Some((r0, r1, c0, c1)) => {
+            (r == r0 && c >= c0) || (r == r1 && c <= c1) || (r > r0 && r < r1)
         }
     }
 }

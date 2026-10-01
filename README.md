@@ -63,6 +63,32 @@ Related version-specific quirks this plugin works around (herdr 0.7.1):
 If a future herdr adds a persistent sized-overlay primitive, the app-drawn box
 (and this whole limitation) could be replaced by it.
 
+## Mouse
+
+floax takes over the mouse with SGR capture, so the host terminal no longer
+starts its own full-canvas selection — a drag that begins inside the box can
+never spill across the border into the backdrop. Input is still parsed from the
+raw byte stream (no key-event translation), and every non-mouse byte reaches the
+embedded PTY verbatim.
+
+Routing depends on who wants the mouse:
+
+- **Inner program owns the mouse** (tmux `mouse on`, vim `:set mouse=a`, fish,
+  …): events are forwarded to the embedded PTY with coordinates re-based into
+the box interior. SGR (`?1006`) and RXVT (`?1015`) encodings are both emitted
+  to match what the program asked for. floax tracks these modes by scanning the
+  PTY output itself (`?1000/?1002/?1003/?1006/?1015 h|l`); vt100 does not.
+- **floax owns the mouse** (nothing asked): a left drag inside the box selects
+  the embedded screen's text, highlighted live, and copies it to the clipboard
+  on release. Drags that start in the backdrop are ignored, and selection is
+  clipped to the interior on both axes.
+
+Clipboard write uses the first available tool — `wl-copy`, `xclip`, `xsel`,
+`pbcopy`, `termux-clipboard-set` — and falls back to an OSC 52 escape when none
+is installed. Middle-click repastes the last selection into the embedded program
+(bracketed paste when it is enabled). Right-click and the wheel are passed to
+the inner program when it owns the mouse, and ignored otherwise.
+
 ## Configuration
 
 Copy `floax.conf.example` to the plugin config dir
