@@ -146,7 +146,7 @@ fn handle_mouse(
     // Button bits: 0-2 button, 32 motion (so left-drag arrives as 32),
     // 64 wheel. Release arrives as button+3 (left = 3) or the original
     // button with the final letter 'm'; any left release finalizes a drag.
-    if (m.button & 0x60) == 0 && ((m.button & 0x03) == 0 || !m.pressed) {
+    if m.is_left_select() {
         let col = (px.saturating_sub(inner.x)).min(inner.width.saturating_sub(1));
         let row = (py.saturating_sub(inner.y)).min(inner.height.saturating_sub(1));
         let mut s = sel.lock().unwrap();

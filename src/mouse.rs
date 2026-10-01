@@ -35,6 +35,15 @@ pub struct SgrMouse {
     pub y: u16,
 }
 
+impl SgrMouse {
+    /// Whether this event drives floax's own left-button selection: a left
+    /// press, a left drag (button 32 = left + motion bit), or any release.
+    /// Wheel events (bit 64) and buttonless motion (35) are excluded.
+    pub fn is_left_select(&self) -> bool {
+        (self.button & 0x40) == 0 && ((self.button & 0x03) == 0 || !self.pressed)
+    }
+}
+
 const ESC: u8 = 0x1b;
 
 /// Result of scanning a buffer for SGR mouse sequences.
@@ -514,6 +523,24 @@ mod tests {
     fn mouse_modes_ignore_non_mouse_csi() {
         let s = scan_mouse_modes(b"\x1b[?25h\x1b[?2004h", &MouseState::default());
         assert!(!s.active());
+    }
+
+    #[test]
+    fn left_select_includes_drag_excludes_wheel_and_hover() {
+        let ev = |button: u16, pressed| SgrMouse {
+            button,
+            motion: button & 32 != 0,
+            pressed,
+            x: 1,
+            y: 1,
+        };
+        assert!(ev(0, true).is_left_select()); // left press
+        assert!(ev(32, true).is_left_select()); // left drag
+        assert!(ev(0, false).is_left_select()); // left release
+        assert!(!ev(35, true).is_left_select()); // buttonless motion (?1003)
+        assert!(!ev(34, true).is_left_select()); // right drag
+        assert!(!ev(64, true).is_left_select()); // wheel up
+        assert!(!ev(65, true).is_left_select()); // wheel down
     }
 
     #[test]
