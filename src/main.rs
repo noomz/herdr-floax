@@ -114,7 +114,7 @@ fn handle_mouse(
     sel: &Arc<Mutex<mouse::Selection>>,
     last_copy: &Arc<Mutex<String>>,
     clip: &Arc<clipboard::Clipboard>,
-    pending_osc: &Arc<Mutex<Option<String>>>,
+    pending_osc: &Arc<Mutex<Vec<u8>>>,
     bracketed: &Arc<AtomicBool>,
     mouse_state: &Arc<Mutex<mouse::MouseState>>,
     tx: &mpsc::Sender<Ev>,
@@ -177,7 +177,7 @@ fn handle_mouse(
                 // Don't block the input thread on a process spawn.
                 std::thread::spawn(move || {
                     if let Some(osc) = clip.set(&text) {
-                        *po.lock().unwrap() = Some(osc);
+                        po.lock().unwrap().extend_from_slice(osc.as_bytes());
                         let _ = tx.send(Ev::Output);
                     }
                 });
@@ -214,7 +214,7 @@ fn main() -> std::io::Result<()> {
     let last_copy = Arc::new(Mutex::new(String::new()));
     // OSC 52 clipboard writes queue here; only the render thread writes
     // stdout, so emitting them there can never tear a frame.
-    let pending_osc = Arc::new(Mutex::new(None::<String>));
+    let pending_osc = Arc::new(Mutex::new(Vec::<u8>::new()));
     let clip = Arc::new(clipboard::Clipboard::detect());
     let bracketed = Arc::new(AtomicBool::new(false));
     let mouse_state = Arc::new(Mutex::new(mouse::MouseState::default()));
@@ -247,9 +247,12 @@ fn main() -> std::io::Result<()> {
         let tx = tx.clone();
         let bracketed = Arc::clone(&bracketed);
         let mouse_state = Arc::clone(&mouse_state);
+        let pending_osc = Arc::clone(&pending_osc);
         let mut reader = pair.master.try_clone_reader().map_err(io_err)?;
         std::thread::spawn(move || {
             let mut buf = [0u8; 8192];
+            let mut osc52 = clipboard::Osc52Relay::default();
+            let mut copied = Vec::new();
             loop {
                 match reader.read(&mut buf) {
                     Ok(0) | Err(_) => {
@@ -261,6 +264,12 @@ fn main() -> std::io::Result<()> {
                         {
                             let mut ms = mouse_state.lock().unwrap();
                             *ms = mouse::scan_mouse_modes(&buf[..n], &ms);
+                        }
+                        // vt100 drops OSC 52; relay the embedded program's
+                        // clipboard writes (tmux, vim, ssh) to herdr.
+                        osc52.scan(&buf[..n], &mut copied);
+                        if !copied.is_empty() {
+                            pending_osc.lock().unwrap().append(&mut copied);
                         }
                         parser.lock().unwrap().process(&buf[..n]);
                         if tx.send(Ev::Output).is_err() {
@@ -379,9 +388,10 @@ fn main() -> std::io::Result<()> {
     loop {
         // Emit any queued OSC 52 clipboard write here: this is the only
         // thread writing stdout, so it can't interleave with a frame.
-        if let Some(osc) = pending_osc.lock().unwrap().take() {
+        let osc = std::mem::take(&mut *pending_osc.lock().unwrap());
+        if !osc.is_empty() {
             let backend = terminal.backend_mut();
-            let _ = backend.write_all(osc.as_bytes());
+            let _ = backend.write_all(&osc);
             let _ = std::io::Write::flush(backend);
         }
         {

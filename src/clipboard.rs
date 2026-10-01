@@ -120,6 +120,113 @@ pub fn osc52(text: &str) -> String {
     out
 }
 
+const OSC52_INTRO: &[u8] = b"\x1b]52;";
+
+/// Upper bound on a buffered, unterminated OSC 52 sequence; anything larger
+/// is dropped instead of growing without limit.
+const MAX_OSC52: usize = 8 * 1024 * 1024;
+
+/// Pulls OSC 52 clipboard writes out of the embedded program's output so they
+/// can be relayed to herdr — vt100 parses and drops them, so without this a
+/// copy made by tmux/vim inside the box never reaches the host clipboard.
+/// Sequences may span reads. Clipboard queries (`?`) are never relayed.
+#[derive(Default)]
+pub struct Osc52Relay {
+    /// Tail of the previous read: an unterminated OSC 52 sequence, or a
+    /// trailing prefix of its introducer.
+    partial: Vec<u8>,
+}
+
+impl Osc52Relay {
+    /// Append every complete OSC 52 write in `bytes` (joined with any partial
+    /// sequence carried from the previous call) to `out`, verbatim.
+    pub fn scan(&mut self, bytes: &[u8], out: &mut Vec<u8>) {
+        let joined;
+        let buf: &[u8] = if self.partial.is_empty() {
+            bytes
+        } else {
+            let mut v = std::mem::take(&mut self.partial);
+            v.extend_from_slice(bytes);
+            joined = v;
+            &joined
+        };
+        let mut i = 0;
+        loop {
+            let Some(start) = find(&buf[i..], OSC52_INTRO).map(|p| p + i) else {
+                let keep = intro_prefix_len(&buf[i..]);
+                self.partial = buf[buf.len() - keep..].to_vec();
+                return;
+            };
+            match osc_end(&buf[start..]) {
+                Some(len) => {
+                    relay_write(&buf[start..start + len], out);
+                    i = start + len;
+                }
+                None => {
+                    if buf.len() - start <= MAX_OSC52 {
+                        self.partial = buf[start..].to_vec();
+                    }
+                    return;
+                }
+            }
+        }
+    }
+}
+
+fn find(hay: &[u8], needle: &[u8]) -> Option<usize> {
+    hay.windows(needle.len()).position(|w| w == needle)
+}
+
+/// Length of the longest proper prefix of the OSC 52 introducer that `tail`
+/// ends with (the rest of it may arrive in the next read).
+fn intro_prefix_len(tail: &[u8]) -> usize {
+    (1..OSC52_INTRO.len())
+        .rev()
+        .find(|&k| tail.ends_with(&OSC52_INTRO[..k]))
+        .unwrap_or(0)
+}
+
+/// Length of the OSC sequence at the start of `seq` through its terminator
+/// (BEL or ST), or `None` if the terminator hasn't arrived yet. An ESC not
+/// followed by `\` aborts the sequence; it is consumed up to that ESC.
+fn osc_end(seq: &[u8]) -> Option<usize> {
+    let mut j = OSC52_INTRO.len();
+    while j < seq.len() {
+        match seq[j] {
+            0x07 => return Some(j + 1),
+            0x1b => {
+                return match seq.get(j + 1) {
+                    Some(b'\\') => Some(j + 2),
+                    Some(_) => Some(j),
+                    None => None,
+                }
+            }
+            _ => j += 1,
+        }
+    }
+    None
+}
+
+/// Append `seq` to `out` if it is a well-terminated clipboard write
+/// (`ESC ] 52 ; <selection> ; <base64> BEL|ST`), not a query or aborted.
+fn relay_write(seq: &[u8], out: &mut Vec<u8>) {
+    let term = if seq.ends_with(b"\x07") {
+        1
+    } else if seq.ends_with(b"\x1b\\") {
+        2
+    } else {
+        return;
+    };
+    let body = &seq[OSC52_INTRO.len()..seq.len() - term];
+    let Some(semi) = body.iter().position(|&b| b == b';') else {
+        return;
+    };
+    if &body[semi + 1..] == b"?" {
+        return;
+    }
+    out.extend_from_slice(seq);
+}
+
 const B64: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
 
 fn base64(data: &[u8]) -> String {
@@ -174,6 +281,49 @@ mod tests {
             assert!(p.starts_with("\u{1b}]52;c;+"));
         }
         assert_eq!(parts[4], "");
+    }
+
+    fn relay(reads: &[&[u8]]) -> Vec<u8> {
+        let mut r = Osc52Relay::default();
+        let mut out = Vec::new();
+        for read in reads {
+            r.scan(read, &mut out);
+        }
+        out
+    }
+
+    #[test]
+    fn relay_passes_complete_writes_verbatim() {
+        let bel = b"\x1b]52;c;aGk=\x07";
+        let st = b"\x1b]52;c;aGk=\x1b\\";
+        assert_eq!(relay(&[b"before\x1b]52;c;aGk=\x07after"]), bel);
+        assert_eq!(relay(&[st]), st);
+        assert_eq!(
+            relay(&[b"\x1b]52;c;YQ==\x07x\x1b]52;c;Yg==\x07"]),
+            b"\x1b]52;c;YQ==\x07\x1b]52;c;Yg==\x07"
+        );
+    }
+
+    #[test]
+    fn relay_joins_sequences_split_across_reads() {
+        let full = b"\x1b]52;c;aGVsbG8=\x1b\\";
+        for cut in 1..full.len() {
+            assert_eq!(relay(&[&full[..cut], &full[cut..]]), full, "cut at {cut}");
+        }
+    }
+
+    #[test]
+    fn relay_drops_queries_aborted_and_other_osc() {
+        assert!(relay(&[b"\x1b]52;c;?\x07"]).is_empty());
+        assert!(relay(&[b"\x1b]52;c;aGk=\x1b[0m"]).is_empty());
+        assert!(relay(&[b"\x1b]0;title\x07\x1b]8;;http://x\x1b\\"]).is_empty());
+        assert!(relay(&[b"\x1b]52;aGk=\x07"]).is_empty()); // no selection field
+    }
+
+    #[test]
+    fn relay_recovers_after_aborted_sequence() {
+        let out = relay(&[b"\x1b]52;c;aGk=\x1b[0m\x1b]52;c;YQ==\x07"]);
+        assert_eq!(out, b"\x1b]52;c;YQ==\x07");
     }
 
     #[test]
